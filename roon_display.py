@@ -57,6 +57,9 @@ KNOWN_STATIONS = {
     },
 }
 
+# Station overlay size — just under the 160px blurred side panel
+STATION_OVERLAY_SIZE = 140
+
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
@@ -87,21 +90,16 @@ MAX_TEXT_W = 480
 
 pi = pigpio.pi()
 
-_station_logo_cache = {}
+_station_logo_cache   = {}
+_stream_overlay_cache = {}
 
 def detect_station(line1):
-    """Return station name if line1 matches a known station, else None."""
     for name in KNOWN_STATIONS:
         if name.lower() in line1.lower():
             return name
     return None
 
 def is_radio_stream(image_key='', line1='', seek_position=None, length=None):
-    """
-    Detect live radio stream.
-    Primary: length is None (live streams have no track length).
-    Fallback: long image key or known station name.
-    """
     if length is None:
         return True
     if image_key and len(image_key) > 50:
@@ -110,7 +108,7 @@ def is_radio_stream(image_key='', line1='', seek_position=None, length=None):
         return True
     return False
 
-def get_station_logo(station_name, size=60):
+def get_station_logo(station_name):
     if station_name in _station_logo_cache:
         return _station_logo_cache[station_name]
     info = KNOWN_STATIONS.get(station_name, {})
@@ -120,7 +118,7 @@ def get_station_logo(station_name, size=60):
     try:
         r = requests.get(url, timeout=10)
         img = Image.open(BytesIO(r.content)).convert('RGBA')
-        img = img.resize((size, size), Image.LANCZOS)
+        img = img.resize((STATION_OVERLAY_SIZE, STATION_OVERLAY_SIZE), Image.LANCZOS)
         _station_logo_cache[station_name] = img
         print(f"[Logo] Fetched logo for {station_name}")
         return img
@@ -129,13 +127,40 @@ def get_station_logo(station_name, size=60):
         _station_logo_cache[station_name] = None
         return None
 
-def overlay_station_logo(canvas, logo, x=12, y=12, alpha=180):
+def get_stream_overlay(station_name, image_key):
+    """Logo for known stations, Roon stream art for unknown ones."""
+    if station_name:
+        logo = get_station_logo(station_name)
+        if logo:
+            return logo
+    if image_key:
+        if image_key in _stream_overlay_cache:
+            return _stream_overlay_cache[image_key]
+        try:
+            art = get_art(image_key)
+            if art:
+                art = art.convert('RGBA').resize(
+                    (STATION_OVERLAY_SIZE, STATION_OVERLAY_SIZE), Image.LANCZOS
+                )
+                _stream_overlay_cache[image_key] = art
+                print(f"[Logo] Cached stream art overlay")
+                return art
+        except Exception as e:
+            print(f"[Logo] Stream overlay error: {e}")
+        _stream_overlay_cache[image_key] = None
+    return None
+
+def overlay_station_logo(canvas, logo, alpha=200):
+    """Overlay station image bottom-right with softened edges."""
     if logo is None:
         return canvas
+    x = 800 - STATION_OVERLAY_SIZE - 10
+    y = 480 - STATION_OVERLAY_SIZE - 10
     rgba = canvas.convert('RGBA')
-    logo_copy = logo.copy()
+    logo_copy = logo.copy().convert('RGBA')
     r, g, b, a = logo_copy.split()
     a = a.point(lambda p: int(p * alpha / 255))
+    a = a.filter(ImageFilter.GaussianBlur(radius=8))
     logo_copy = Image.merge('RGBA', (r, g, b, a))
     rgba.paste(logo_copy, (x, y), logo_copy)
     return rgba.convert('RGB')
@@ -257,15 +282,15 @@ def make_art_clock_screen(art, show_mic=False):
 
 # --- Art screen ---
 
-def make_base_screen(art, station_logo=None):
+def make_base_screen(art, station_overlay=None):
     canvas = Image.new('RGB', (800, 480), (0, 0, 0))
     bg = art.resize((800, 480), Image.LANCZOS)
     bg = bg.filter(ImageFilter.GaussianBlur(radius=cfg["blur_radius"]))
     canvas.paste(bg, (0, 0))
     fg = art.resize((480, 480), Image.LANCZOS)
     canvas.paste(fg, (160, 0))
-    if station_logo:
-        canvas = overlay_station_logo(canvas, station_logo)
+    if station_overlay:
+        canvas = overlay_station_logo(canvas, station_overlay)
     return canvas
 
 def draw_progress(canvas, seek_pos, length):
@@ -347,7 +372,11 @@ def composite(base, overlay, seek_pos=None, length=None):
     return canvas
 
 
-def display_roon(base, artist, album, track, seek_pos, length):
+def display_roon(base, artist, album, track, seek_pos, length, radio=False, track_id=None):
+    """
+    Display Roon art with text and progress bar.
+    radio=True: use line2 (track_id) to detect track changes instead of line1.
+    """
     font_artist = ImageFont.truetype(FONT_BOLD, cfg["size_artist"])
     font_album  = ImageFont.truetype(FONT_REG,  cfg["size_album"])
     font_track  = ImageFont.truetype(FONT_REG,  cfg["size_track"])
@@ -396,15 +425,22 @@ def display_roon(base, artist, album, track, seek_pos, length):
         write_fb(composite(base, overlay, seek_pos, length))
         time.sleep(1)
 
+    # Keep progress bar updated until track changes or stops
     while True:
         zone_check = get_zone()
         if not zone_check or zone_check["state"] != "playing":
             break
-        new_track = zone_check["now_playing"]["two_line"]["line1"]
-        if new_track != track:
+        np_check = zone_check["now_playing"]
+        if radio:
+            current = np_check["two_line"]["line2"]
+            compare = track_id or track
+        else:
+            current = np_check["two_line"]["line1"]
+            compare = track
+        if current != compare:
             break
-        seek_pos = zone_check["now_playing"].get("seek_position")
-        length   = zone_check["now_playing"].get("length")
+        seek_pos = np_check.get("seek_position")
+        length   = np_check.get("length")
         screen = base.copy()
         screen = draw_progress(screen, seek_pos, length)
         write_fb(screen)
@@ -476,7 +512,6 @@ def get_art(image_key):
         return None
 
 def clean_track_for_itunes(track):
-    """Strip common radio suffixes that confuse iTunes search."""
     for sep in ['|', '(', '[']:
         track = track.split(sep)[0]
     return track.strip()
@@ -504,7 +539,6 @@ def get_itunes_art(artist, track):
     return None
 
 def get_station_fallback_art(station_name, image_key):
-    """Get station stream art or logo as fallback when no track art available."""
     if image_key:
         art = get_art(image_key)
         if art:
@@ -521,7 +555,6 @@ def get_station_fallback_art(station_name, image_key):
     return None
 
 def parse_radio_track(line2):
-    """Parse Artist - Track from radio metadata."""
     if ' - ' in line2:
         parts = line2.split(' - ', 1)
         return parts[0].strip(), parts[1].strip()
@@ -565,10 +598,7 @@ while True:
         clock_idle_since = None
         clock_last_min   = -1
 
-        # Detect known station from line1
         station_name = detect_station(line1)
-
-        # Detect radio stream
         radio = is_radio_stream(image_key, line1, seek_pos, length)
 
         if radio and ' - ' in line2:
@@ -587,20 +617,17 @@ while True:
             if not radio:
                 station_name = None
 
-        # No track metadata yet — always show fallback art and retry
-        # Set last_track = None so next poll retriggers iTunes when metadata arrives
-        if not display_artist and not display_track:
+        # No track metadata yet — show fallback art and retry
+        if not display_artist and not line2.strip():
             print(f"[Roon] No metadata yet — retrying...")
             if image_key != last_image_key:
-                # New stream — show fallback art
                 fallback = get_station_fallback_art(station_name, image_key) if station_name else get_art(image_key)
                 if fallback:
-                    station_logo = get_station_logo(station_name) if station_name else None
-                    last_art     = fallback
-                    base         = make_base_screen(fallback, station_logo=station_logo)
+                    st_overlay = get_stream_overlay(station_name, image_key)
+                    last_art   = fallback
+                    base       = make_base_screen(fallback, station_overlay=st_overlay)
                     write_fb(base)
                 last_image_key = image_key
-            # Always keep last_track None so we retrigger when metadata arrives
             last_track = None
             time.sleep(2)
             continue
@@ -613,11 +640,9 @@ while True:
                 print(f"[iTunes] Radio stream — fetching art for {display_artist} - {display_track}")
                 new_art = get_itunes_art(display_artist, display_track)
 
-            # Fall back to stream art or station logo if iTunes failed
             if not new_art and use_itunes:
                 print(f"[Roon] iTunes failed — using station fallback art")
                 new_art = get_station_fallback_art(station_name, image_key)
-                # Don't lock in track_id — retrigger when metadata changes
                 last_image_key = image_key
                 last_track     = None
             elif not new_art and image_key:
@@ -629,10 +654,11 @@ while True:
                 last_track     = track_id
 
             if new_art:
-                station_logo = get_station_logo(station_name) if station_name else None
-                last_art     = new_art
-                base         = make_base_screen(new_art, station_logo=station_logo)
-                display_roon(base, display_artist, display_album, display_track, seek_pos, length)
+                st_overlay = get_stream_overlay(station_name, image_key) if radio else None
+                last_art   = new_art
+                base       = make_base_screen(new_art, station_overlay=st_overlay)
+                display_roon(base, display_artist, display_album, display_track,
+                             seek_pos, length, radio=radio, track_id=line2)
 
     else:
         if last_image_key is not None:
