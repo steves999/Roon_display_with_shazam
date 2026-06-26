@@ -50,9 +50,11 @@ DEFAULT_CONFIG = {
     "retry_delay": 15,
 }
 
-# Radio station logo URLs
-STATION_LOGOS = {
-    "Radio Paradise": "https://dl.svgcdn.com/png/arcticons/radioparadise-400.png",
+# Known radio stations — name must appear in Roon's line1
+KNOWN_STATIONS = {
+    "Radio Paradise": {
+        "logo_url": "https://dl.svgcdn.com/png/arcticons/radioparadise-400.png",
+    },
 }
 
 def load_config():
@@ -85,14 +87,34 @@ MAX_TEXT_W = 480
 
 pi = pigpio.pi()
 
-# Cache for station logos
 _station_logo_cache = {}
 
+def detect_station(line1):
+    """Return station name if line1 matches a known station, else None."""
+    for name in KNOWN_STATIONS:
+        if name.lower() in line1.lower():
+            return name
+    return None
+
+def is_radio_stream(image_key='', line1='', seek_position=None, length=None):
+    """
+    Detect live radio stream.
+    Primary: length is None (live streams have no track length).
+    Fallback: long image key or known station name.
+    """
+    if length is None:
+        return True
+    if image_key and len(image_key) > 50:
+        return True
+    if line1 and detect_station(line1):
+        return True
+    return False
+
 def get_station_logo(station_name, size=60):
-    """Fetch and cache a station logo by name."""
     if station_name in _station_logo_cache:
         return _station_logo_cache[station_name]
-    url = STATION_LOGOS.get(station_name)
+    info = KNOWN_STATIONS.get(station_name, {})
+    url  = info.get("logo_url")
     if not url:
         return None
     try:
@@ -108,7 +130,6 @@ def get_station_logo(station_name, size=60):
         return None
 
 def overlay_station_logo(canvas, logo, x=12, y=12, alpha=180):
-    """Overlay station logo onto canvas."""
     if logo is None:
         return canvas
     rgba = canvas.convert('RGBA')
@@ -454,9 +475,15 @@ def get_art(image_key):
         print(f"Error getting art: {e}")
         return None
 
+def clean_track_for_itunes(track):
+    """Strip common radio suffixes that confuse iTunes search."""
+    for sep in ['|', '(', '[']:
+        track = track.split(sep)[0]
+    return track.strip()
+
 def get_itunes_art(artist, track):
-    """Fetch album art from iTunes Search API."""
     try:
+        track = clean_track_for_itunes(track)
         query = requests.utils.quote(f"{artist} {track}")
         r = requests.get(
             f"https://itunes.apple.com/search?term={query}&entity=song&limit=1",
@@ -476,23 +503,29 @@ def get_itunes_art(artist, track):
         print(f"[iTunes] Error: {e}")
     return None
 
-def is_radio_stream(image_key):
-    """Radio streams have very long image keys."""
-    return image_key and len(image_key) > 50
+def get_station_fallback_art(station_name, image_key):
+    """Get station stream art or logo as fallback when no track art available."""
+    if image_key:
+        art = get_art(image_key)
+        if art:
+            print(f"[Roon] Using stream art as fallback")
+            return art
+    if station_name:
+        logo = get_station_logo(station_name)
+        if logo:
+            canvas = Image.new('RGB', (600, 600), (20, 20, 20))
+            logo_large = logo.resize((300, 300), Image.LANCZOS).convert('RGBA')
+            canvas.paste(logo_large, (150, 150), logo_large)
+            print(f"[Logo] Using station logo as fallback art")
+            return canvas
+    return None
 
 def parse_radio_track(line2):
-    """Parse 'Artist - Track' from radio stream metadata."""
+    """Parse Artist - Track from radio metadata."""
     if ' - ' in line2:
         parts = line2.split(' - ', 1)
         return parts[0].strip(), parts[1].strip()
     return '', line2.strip()
-
-def detect_station(line1):
-    """Detect known station name from line1."""
-    for name in STATION_LOGOS:
-        if name.lower() in line1.lower():
-            return name
-    return None
 
 
 # --- Main loop ---
@@ -532,39 +565,73 @@ while True:
         clock_idle_since = None
         clock_last_min   = -1
 
+        # Detect known station from line1
+        station_name = detect_station(line1)
+
         # Detect radio stream
-        if is_radio_stream(image_key) and ' - ' in line2:
+        radio = is_radio_stream(image_key, line1, seek_pos, length)
+
+        if radio and ' - ' in line2:
             radio_artist, radio_track = parse_radio_track(line2)
             display_artist = radio_artist
             display_track  = radio_track
-            display_album  = line1  # station name
+            display_album  = line1
             use_itunes     = True
             track_id       = line2
-            station_name   = detect_station(line1)
         else:
             display_artist = line2
             display_track  = line1
             display_album  = album
             use_itunes     = False
             track_id       = line1
-            station_name   = None
+            if not radio:
+                station_name = None
+
+        # No track metadata yet — always show fallback art and retry
+        # Set last_track = None so next poll retriggers iTunes when metadata arrives
+        if not display_artist and not display_track:
+            print(f"[Roon] No metadata yet — retrying...")
+            if image_key != last_image_key:
+                # New stream — show fallback art
+                fallback = get_station_fallback_art(station_name, image_key) if station_name else get_art(image_key)
+                if fallback:
+                    station_logo = get_station_logo(station_name) if station_name else None
+                    last_art     = fallback
+                    base         = make_base_screen(fallback, station_logo=station_logo)
+                    write_fb(base)
+                last_image_key = image_key
+            # Always keep last_track None so we retrigger when metadata arrives
+            last_track = None
+            time.sleep(2)
+            continue
 
         if (image_key or track_id) and (image_key != last_image_key or track_id != last_track):
             print(f"[Roon] Now playing: {display_artist} / {display_album} / {display_track}")
             new_art = None
+
             if use_itunes:
                 print(f"[iTunes] Radio stream — fetching art for {display_artist} - {display_track}")
                 new_art = get_itunes_art(display_artist, display_track)
-            elif image_key:
-                new_art = get_art(image_key)
 
-            if new_art:
-                # Fetch station logo if known station
-                station_logo = get_station_logo(station_name) if station_name else None
-                last_art       = new_art
-                base           = make_base_screen(new_art, station_logo=station_logo)
+            # Fall back to stream art or station logo if iTunes failed
+            if not new_art and use_itunes:
+                print(f"[Roon] iTunes failed — using station fallback art")
+                new_art = get_station_fallback_art(station_name, image_key)
+                # Don't lock in track_id — retrigger when metadata changes
+                last_image_key = image_key
+                last_track     = None
+            elif not new_art and image_key:
+                new_art = get_art(image_key)
                 last_image_key = image_key
                 last_track     = track_id
+            else:
+                last_image_key = image_key
+                last_track     = track_id
+
+            if new_art:
+                station_logo = get_station_logo(station_name) if station_name else None
+                last_art     = new_art
+                base         = make_base_screen(new_art, station_logo=station_logo)
                 display_roon(base, display_artist, display_album, display_track, seek_pos, length)
 
     else:
