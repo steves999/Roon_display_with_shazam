@@ -51,11 +51,7 @@ DEFAULT_CONFIG = {
 }
 
 # Known radio stations — name must appear in Roon's line1
-KNOWN_STATIONS = {
-    "Radio Paradise": {
-        "logo_url": "https://dl.svgcdn.com/png/arcticons/radioparadise-400.png",
-    },
-}
+KNOWN_STATIONS = {}
 
 # Station overlay size — just under the 160px blurred side panel
 STATION_OVERLAY_SIZE = 140
@@ -151,7 +147,7 @@ def get_stream_overlay(station_name, image_key):
     return None
 
 def overlay_station_logo(canvas, logo, alpha=200):
-    """Overlay station image bottom-right with softened edges."""
+    """Overlay station image bottom-right with feathered edges."""
     if logo is None:
         return canvas
     x = 800 - STATION_OVERLAY_SIZE - 10
@@ -160,7 +156,13 @@ def overlay_station_logo(canvas, logo, alpha=200):
     logo_copy = logo.copy().convert('RGBA')
     r, g, b, a = logo_copy.split()
     a = a.point(lambda p: int(p * alpha / 255))
-    a = a.filter(ImageFilter.GaussianBlur(radius=8))
+    size = logo_copy.size
+    feather = 16
+    mask = Image.new('L', size, 0)
+    inner = Image.new('L', (size[0] - feather*2, size[1] - feather*2), 255)
+    mask.paste(inner, (feather, feather))
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=feather))
+    a = Image.composite(a, Image.new('L', size, 0), mask)
     logo_copy = Image.merge('RGBA', (r, g, b, a))
     rgba.paste(logo_copy, (x, y), logo_copy)
     return rgba.convert('RGB')
@@ -202,6 +204,36 @@ def write_fb(img):
     with open(FB, 'wb') as f:
         f.write(rgb888_to_rgb565(img))
 
+
+# --- Volume indicator ---
+
+def get_volume_pct(zone):
+    """Return volume as 0-100 percentage from zone data."""
+    try:
+        vol = zone["outputs"][0]["volume"]
+        v   = vol["value"]
+        mn  = vol["min"]
+        mx  = vol["max"]
+        return max(0, min(100, (v - mn) / (mx - mn) * 100))
+    except:
+        return None
+
+def draw_volume_circle(canvas, pct, cx=35, cy=450, radius=24):
+    """Draw a semi-transparent pie-style volume indicator bottom left."""
+    if pct is None:
+        return canvas
+    overlay = Image.new('RGBA', canvas.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    # Dark background
+    draw.ellipse([cx-radius, cy-radius, cx+radius, cy+radius],
+                 fill=(60, 60, 60, 80), outline=(140, 140, 140, 100), width=2)
+    # White active arc — clockwise from 12
+    if pct > 1:
+        sweep = int(360 * pct / 100)
+        draw.pieslice([cx-radius, cy-radius, cx+radius, cy+radius],
+                      start=-90, end=-90+sweep,
+                      fill=(255, 255, 255, 100))
+    return Image.alpha_composite(canvas.convert('RGBA'), overlay).convert('RGB')
 
 # --- Clock ---
 
@@ -373,10 +405,6 @@ def composite(base, overlay, seek_pos=None, length=None):
 
 
 def display_roon(base, artist, album, track, seek_pos, length, radio=False, track_id=None):
-    """
-    Display Roon art with text and progress bar.
-    radio=True: use line2 (track_id) to detect track changes instead of line1.
-    """
     font_artist = ImageFont.truetype(FONT_BOLD, cfg["size_artist"])
     font_album  = ImageFont.truetype(FONT_REG,  cfg["size_album"])
     font_track  = ImageFont.truetype(FONT_REG,  cfg["size_track"])
@@ -425,7 +453,7 @@ def display_roon(base, artist, album, track, seek_pos, length, radio=False, trac
         write_fb(composite(base, overlay, seek_pos, length))
         time.sleep(1)
 
-    # Keep progress bar updated until track changes or stops
+    # Keep progress bar and volume updated until track changes or stops
     while True:
         zone_check = get_zone()
         if not zone_check or zone_check["state"] != "playing":
@@ -441,8 +469,10 @@ def display_roon(base, artist, album, track, seek_pos, length, radio=False, trac
             break
         seek_pos = np_check.get("seek_position")
         length   = np_check.get("length")
-        screen = base.copy()
-        screen = draw_progress(screen, seek_pos, length)
+        vol_pct  = get_volume_pct(zone_check)
+        screen   = base.copy()
+        screen   = draw_progress(screen, seek_pos, length)
+        screen   = draw_volume_circle(screen, vol_pct)
         write_fb(screen)
         time.sleep(5)
 
@@ -545,13 +575,19 @@ def get_station_fallback_art(station_name, image_key):
             print(f"[Roon] Using stream art as fallback")
             return art
     if station_name:
-        logo = get_station_logo(station_name)
-        if logo:
-            canvas = Image.new('RGB', (600, 600), (20, 20, 20))
-            logo_large = logo.resize((300, 300), Image.LANCZOS).convert('RGBA')
-            canvas.paste(logo_large, (150, 150), logo_large)
-            print(f"[Logo] Using station logo as fallback art")
-            return canvas
+        info = KNOWN_STATIONS.get(station_name, {})
+        url  = info.get("logo_url")
+        if url:
+            try:
+                r = requests.get(url, timeout=10)
+                logo = Image.open(BytesIO(r.content)).convert('RGBA')
+                canvas = Image.new('RGB', (600, 600), (20, 20, 20))
+                logo_large = logo.resize((300, 300), Image.LANCZOS)
+                canvas.paste(logo_large, (150, 150), logo_large)
+                print(f"[Logo] Using station logo as fallback art")
+                return canvas
+            except Exception as e:
+                print(f"[Logo] Fallback art error: {e}")
     return None
 
 def parse_radio_track(line2):
