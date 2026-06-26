@@ -50,6 +50,11 @@ DEFAULT_CONFIG = {
     "retry_delay": 15,
 }
 
+# Radio station logo URLs
+STATION_LOGOS = {
+    "Radio Paradise": "https://dl.svgcdn.com/png/arcticons/radioparadise-400.png",
+}
+
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE) as f:
@@ -79,6 +84,40 @@ MARGIN     = 12
 MAX_TEXT_W = 480
 
 pi = pigpio.pi()
+
+# Cache for station logos
+_station_logo_cache = {}
+
+def get_station_logo(station_name, size=60):
+    """Fetch and cache a station logo by name."""
+    if station_name in _station_logo_cache:
+        return _station_logo_cache[station_name]
+    url = STATION_LOGOS.get(station_name)
+    if not url:
+        return None
+    try:
+        r = requests.get(url, timeout=10)
+        img = Image.open(BytesIO(r.content)).convert('RGBA')
+        img = img.resize((size, size), Image.LANCZOS)
+        _station_logo_cache[station_name] = img
+        print(f"[Logo] Fetched logo for {station_name}")
+        return img
+    except Exception as e:
+        print(f"[Logo] Error fetching {station_name}: {e}")
+        _station_logo_cache[station_name] = None
+        return None
+
+def overlay_station_logo(canvas, logo, x=12, y=12, alpha=180):
+    """Overlay station logo onto canvas."""
+    if logo is None:
+        return canvas
+    rgba = canvas.convert('RGBA')
+    logo_copy = logo.copy()
+    r, g, b, a = logo_copy.split()
+    a = a.point(lambda p: int(p * alpha / 255))
+    logo_copy = Image.merge('RGBA', (r, g, b, a))
+    rgba.paste(logo_copy, (x, y), logo_copy)
+    return rgba.convert('RGB')
 
 def hex_to_rgb(h):
     h = h.lstrip('#')
@@ -197,13 +236,15 @@ def make_art_clock_screen(art, show_mic=False):
 
 # --- Art screen ---
 
-def make_base_screen(art):
+def make_base_screen(art, station_logo=None):
     canvas = Image.new('RGB', (800, 480), (0, 0, 0))
     bg = art.resize((800, 480), Image.LANCZOS)
     bg = bg.filter(ImageFilter.GaussianBlur(radius=cfg["blur_radius"]))
     canvas.paste(bg, (0, 0))
     fg = art.resize((480, 480), Image.LANCZOS)
     canvas.paste(fg, (160, 0))
+    if station_logo:
+        canvas = overlay_station_logo(canvas, station_logo)
     return canvas
 
 def draw_progress(canvas, seek_pos, length):
@@ -386,7 +427,6 @@ def display_shazam(base, artist, album, track):
     for _ in range(cfg["text_hold"]):
         time.sleep(1)
 
-    # Show clean art with just ♩ symbol
     clean = base.copy()
     rgba  = clean.convert('RGBA')
     draw  = ImageDraw.Draw(rgba)
@@ -437,15 +477,22 @@ def get_itunes_art(artist, track):
     return None
 
 def is_radio_stream(image_key):
-    """Radio streams have very long image keys (hash of stream URL)."""
+    """Radio streams have very long image keys."""
     return image_key and len(image_key) > 50
 
 def parse_radio_track(line2):
-    """Parse 'Artist - Track' from radio stream metadata line2."""
+    """Parse 'Artist - Track' from radio stream metadata."""
     if ' - ' in line2:
         parts = line2.split(' - ', 1)
         return parts[0].strip(), parts[1].strip()
     return '', line2.strip()
+
+def detect_station(line1):
+    """Detect known station name from line1."""
+    for name in STATION_LOGOS:
+        if name.lower() in line1.lower():
+            return name
+    return None
 
 
 # --- Main loop ---
@@ -475,8 +522,8 @@ while True:
 
         np_info   = zone["now_playing"]
         image_key = np_info.get("image_key")
-        line1     = np_info["two_line"]["line1"]  # track name or station name
-        line2     = np_info["two_line"]["line2"]  # artist or "Artist - Track" for radio
+        line1     = np_info["two_line"]["line1"]
+        line2     = np_info["two_line"]["line2"]
         album     = np_info.get("three_line", {}).get("line3", "")
         seek_pos  = np_info.get("seek_position")
         length    = np_info.get("length")
@@ -485,26 +532,22 @@ while True:
         clock_idle_since = None
         clock_last_min   = -1
 
-        # Detect radio stream — long image key and line2 contains "Artist - Track"
+        # Detect radio stream
         if is_radio_stream(image_key) and ' - ' in line2:
-            # Radio stream — parse real artist/track from line2
             radio_artist, radio_track = parse_radio_track(line2)
             display_artist = radio_artist
             display_track  = radio_track
-            display_album  = line1  # station name as "album"
+            display_album  = line1  # station name
             use_itunes     = True
-            track_id       = line2  # use line2 as change detector
-            artist         = radio_artist
-            track          = radio_track
+            track_id       = line2
+            station_name   = detect_station(line1)
         else:
-            # Normal Roon track
             display_artist = line2
             display_track  = line1
             display_album  = album
             use_itunes     = False
             track_id       = line1
-            artist         = line2
-            track          = line1
+            station_name   = None
 
         if (image_key or track_id) and (image_key != last_image_key or track_id != last_track):
             print(f"[Roon] Now playing: {display_artist} / {display_album} / {display_track}")
@@ -516,8 +559,10 @@ while True:
                 new_art = get_art(image_key)
 
             if new_art:
+                # Fetch station logo if known station
+                station_logo = get_station_logo(station_name) if station_name else None
                 last_art       = new_art
-                base           = make_base_screen(new_art)
+                base           = make_base_screen(new_art, station_logo=station_logo)
                 last_image_key = image_key
                 last_track     = track_id
                 display_roon(base, display_artist, display_album, display_track, seek_pos, length)
@@ -539,13 +584,11 @@ while True:
         shazam_track  = shazam_listener.get_current_track()
         silence_secs  = shazam_listener.seconds_since_sound()
 
-        # Only clear displayed track if genuinely silent
         if silence_secs > cfg["silence_timeout"] + cfg["sample_interval"] and last_shazam_track is not None:
             print(f"[Shazam] Silence {silence_secs:.0f}s — returning to clock")
             last_shazam_track = None
             clock_last_min    = -1
 
-        # Only update display if we have a new track
         if (shazam_track is not None
                 and silence_secs <= cfg["silence_timeout"] + cfg["sample_interval"]
                 and (last_shazam_track is None
