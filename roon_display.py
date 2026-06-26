@@ -414,6 +414,39 @@ def get_art(image_key):
         print(f"Error getting art: {e}")
         return None
 
+def get_itunes_art(artist, track):
+    """Fetch album art from iTunes Search API."""
+    try:
+        query = requests.utils.quote(f"{artist} {track}")
+        r = requests.get(
+            f"https://itunes.apple.com/search?term={query}&entity=song&limit=1",
+            timeout=10
+        )
+        data = r.json()
+        if data['resultCount'] > 0:
+            url = data['results'][0].get('artworkUrl100', '')
+            if url:
+                url = url.replace('100x100', '600x600')
+                img_r = requests.get(url, timeout=10)
+                img = Image.open(BytesIO(img_r.content))
+                print(f"[iTunes] Art found for {artist} - {track}")
+                return img
+        print(f"[iTunes] No art found for {artist} - {track}")
+    except Exception as e:
+        print(f"[iTunes] Error: {e}")
+    return None
+
+def is_radio_stream(image_key):
+    """Radio streams have very long image keys (hash of stream URL)."""
+    return image_key and len(image_key) > 50
+
+def parse_radio_track(line2):
+    """Parse 'Artist - Track' from radio stream metadata line2."""
+    if ' - ' in line2:
+        parts = line2.split(' - ', 1)
+        return parts[0].strip(), parts[1].strip()
+    return '', line2.strip()
+
 
 # --- Main loop ---
 
@@ -423,7 +456,7 @@ last_art          = None
 clock_idle_since  = None
 clock_last_min    = -1
 shazam_active     = False
-last_shazam_track = None  # dict of last displayed Shazam track
+last_shazam_track = None
 last_mic_state    = False
 
 print("Starting Roon display...")
@@ -442,8 +475,8 @@ while True:
 
         np_info   = zone["now_playing"]
         image_key = np_info.get("image_key")
-        artist    = np_info["two_line"]["line2"]
-        track     = np_info["two_line"]["line1"]
+        line1     = np_info["two_line"]["line1"]  # track name or station name
+        line2     = np_info["two_line"]["line2"]  # artist or "Artist - Track" for radio
         album     = np_info.get("three_line", {}).get("line3", "")
         seek_pos  = np_info.get("seek_position")
         length    = np_info.get("length")
@@ -452,15 +485,42 @@ while True:
         clock_idle_since = None
         clock_last_min   = -1
 
-        if image_key and (image_key != last_image_key or track != last_track):
-            print(f"[Roon] Now playing: {artist} / {album} / {track}")
-            new_art = get_art(image_key)
+        # Detect radio stream — long image key and line2 contains "Artist - Track"
+        if is_radio_stream(image_key) and ' - ' in line2:
+            # Radio stream — parse real artist/track from line2
+            radio_artist, radio_track = parse_radio_track(line2)
+            display_artist = radio_artist
+            display_track  = radio_track
+            display_album  = line1  # station name as "album"
+            use_itunes     = True
+            track_id       = line2  # use line2 as change detector
+            artist         = radio_artist
+            track          = radio_track
+        else:
+            # Normal Roon track
+            display_artist = line2
+            display_track  = line1
+            display_album  = album
+            use_itunes     = False
+            track_id       = line1
+            artist         = line2
+            track          = line1
+
+        if (image_key or track_id) and (image_key != last_image_key or track_id != last_track):
+            print(f"[Roon] Now playing: {display_artist} / {display_album} / {display_track}")
+            new_art = None
+            if use_itunes:
+                print(f"[iTunes] Radio stream — fetching art for {display_artist} - {display_track}")
+                new_art = get_itunes_art(display_artist, display_track)
+            elif image_key:
+                new_art = get_art(image_key)
+
             if new_art:
                 last_art       = new_art
                 base           = make_base_screen(new_art)
                 last_image_key = image_key
-                last_track     = track
-                display_roon(base, artist, album, track, seek_pos, length)
+                last_track     = track_id
+                display_roon(base, display_artist, display_album, display_track, seek_pos, length)
 
     else:
         if last_image_key is not None:
@@ -480,14 +540,14 @@ while True:
         silence_secs  = shazam_listener.seconds_since_sound()
 
         # Only clear displayed track if genuinely silent
-        if silence_secs > cfg["silence_timeout"] and last_shazam_track is not None:
+        if silence_secs > cfg["silence_timeout"] + cfg["sample_interval"] and last_shazam_track is not None:
             print(f"[Shazam] Silence {silence_secs:.0f}s — returning to clock")
             last_shazam_track = None
             clock_last_min    = -1
 
-        # Only update display if we have a new track (different title/artist)
+        # Only update display if we have a new track
         if (shazam_track is not None
-                and silence_secs <= cfg["silence_timeout"]
+                and silence_secs <= cfg["silence_timeout"] + cfg["sample_interval"]
                 and (last_shazam_track is None
                      or shazam_track['title'] != last_shazam_track['title']
                      or shazam_track['artist'] != last_shazam_track['artist'])):
@@ -506,7 +566,6 @@ while True:
                                shazam_track['title'])
 
         elif last_shazam_track is None:
-            # No match or silence — show clock
             if clock_idle_since is not None:
                 if time.time() - clock_idle_since >= cfg["dim_after_secs"]:
                     set_brightness(get_brightness_for_time())
